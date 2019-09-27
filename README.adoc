@@ -1,0 +1,34 @@
+# Event Sourcing for Finance
+
+You have a flat file (for instance) full of payment records. Each one has to be processed and sent to an external system for settlement. It's a common use case, and one that can be generalized and extended. Each record in the input set is an "event", and the system that we build to process the payments is in the category of "event sourcing applications". There are some distinct features of such problems in the finance space which reduce to accounting problems: money cannot be destroyed or created.
+
+Our interest is in the boilerplate aspects of the business problem: if 10 teams all solve the same problem in different domains, which aspects do the solutions share in common? Could they be abstracted, with maybe some restrictions on the toolset (like a library for Spring Cloud Streams and Kafka for instance)?
+
+## Once-And-Only-Once
+
+If any payment is processed twice by mistake the external system will not notice, and there will be financial consequences. If any payment is not sent to the external system, it will not notice that either. So each record in the input set has to be processed once, and only once.
+
+## A Simple Workflow
+
+[plantuml]
+....
+actor Payer
+actor Settler
+participant PENDING
+participant DONE
+participant Processor
+database Events
+Payer -> PENDING: record
+PENDING -> Processor: record
+Processor --> Processor: extract key
+Processor -> Events: key,status=PENDING
+Settler -> DONE: key
+DONE -> Processor: key
+Processor -> Events: key
+Events -> Processor: PENDING
+Processor -> Events: key,status=DONE 
+....
+
+## Pesky Side Effects
+
+## Extended Workflows
