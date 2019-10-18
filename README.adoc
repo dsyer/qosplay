@@ -1,33 +1,124 @@
-# Event Sourcing for Finance
+# An Ode or a Saga? Event Sourcing for Finance
 
 You have a flat file (for instance) full of payment records. Each one has to be processed and sent to an external system for settlement. It's a common use case, and one that can be generalized and extended. Each record in the input set is an "event", and the system that we build to process the payments is in the category of "event sourcing applications". There are some distinct features of such problems in the finance space which reduce to accounting problems: money cannot be destroyed or created.
 
-Our interest is in the boilerplate aspects of the business problem: if 10 teams all solve the same problem in different domains, which aspects do the solutions share in common? Could they be abstracted, with maybe some restrictions on the toolset (like a library for Spring Cloud Streams and Kafka for instance)?
+Our interest is in the boilerplate aspects of the business problem: if 10 teams all solve the same problem in different domains, which aspects do the solutions share in common? Could they be abstracted, with maybe some restrictions on the toolset (like a library for Spring Cloud and Kafka maybe)? We use the payment processing engine as an example of the end goal of such a system, but the idea is that it can be generalized, and common, cross-cutting, important but not business-specific pieces can be extracted.
+
+Spring has a nice programming model for abstracting common concerns. Developers like it and feel comfortable building stuff on top of it. Kafka has some features that can be used to impose non-functional constraints, collectively known as "quality-of-service". It is not unique in those features, but it has a lot of traction in the Spring community, so we might as well start there if we are exploring and prototyping.
 
 ## Once-And-Only-Once
 
-If any payment is processed twice by mistake the external system will not notice, and there will be financial consequences. If any payment is not sent to the external system, it will not notice that either. So each record in the input set has to be processed once, and only once.
+If any payment is processed twice by mistake the external system will not notice, and there will be financial consequences. If any payment is not sent to the external system, it will not notice that either, and the value of the payment may be lost. So each record in the input set has to be processed once, and only once.
+
+The payment processing engine is a distributed system, almost of necessity. We are deliberately presenting a simplified view of it, but in reality it is large, complex, and not in the control of a single small team. Event sourcing applications are also distributed systems in general, but in general they don't always have the "once-and-only-once" guarantees that we need in finance. The underlying technologies in such an application may themselves have some "quality of service" features that might help, but they need to be used with care since this is a notoriously difficult problem.
+
+In fact there are plenty of angry people on the internet who claim (with some justification) that once-only delivery is an impossible goal. That might be true in some purist and completely general sense. Fortunately for us there are specific scenarios or flavours of once-only that we can implement with care, and then design our system around those.
 
 ## A Simple Workflow
+
+The simplest possible workflow for a payment system would be (at a high level): 
+
+****
+.Payment Process
+Accept payment instructions in a 'pending' state, and settlement instructions in a 'done' state. Match them up so that each payment is paired with precisely one settlement.
+****
+
+We can express that process as a simple sequence diagram:
 
 [plantuml]
 ....
 actor Payer
 actor Settler
-participant PENDING
-participant DONE
-participant Processor
+collections PENDING as "TOPIC:\npending"
+participant DONE as "TOPIC:\ndone"
+participant Ingester
 database Events
 Payer -> PENDING: record
-PENDING -> Processor: record
-Processor --> Processor: extract key
-Processor -> Events: key,status=PENDING
+PENDING -> Ingester: record
+Ingester --> Ingester: extract key
+Ingester -> Events: key exists?
+note right: Fetch current status for key
+Events -> Ingester: false
+note left: None. So safe to save.
+Ingester -> Events: key,status=PENDING
+note right
+  Register the PENDING
+  status for this key.
+end note
 Settler -> DONE: key
-DONE -> Processor: key
-Processor -> Events: key
-Events -> Processor: PENDING
-Processor -> Events: key,status=DONE 
+note left: Must know the key
+DONE -> Ingester: key
+Ingester -> Events: key status?
+note right: Fetch current status for key
+Events -> Ingester: PENDING
+Ingester -> Events: key,status=DONE 
+note left: Only if it is PENDING
 ....
+
+In the diagram "Events" is drawn as a database, but it could possibly be implemented in a variety of different ways. In particular, if the input topics are in Kafka, then Kafka can be used as a key-value store, so it might make sense to use that for the Events store, as long as it can provide the required transaction semantics.
+
+### Unique Keys
+
+The most important feature of this process is that we use a reliable and consistent (from the point of view of the ingester) database to prevent duplicates. The logic for that relies on every input record having a globally unique identifier. If such an identifier (or key) can be assigned to or extracted from the input record then we have confidence that the simplified process is properly constrained.
+
+The implementation of the unique keys for input records is thus an important part of the design. Often the best such key is a business identifier - you usually only want to pay Joe Bloggs $10 last Thursday once, and if you decide to pay him twice you have to explicitly say so. This amounts to a hash of the input data, or some combination of a set of fields from the input data. There might also be technical keys that can be used, depending on the implementation. For example, if the payer is processing an input file, the file name and line number might be globally unique. Another option for a technical identifier is a globally unique counter, if you have one (e.g. the offset in Kafka terms in the "pending" topic). The more technical the key, the more you give up control of the business constraints.
+
+Another key feature of the process is that the settler needs to know the input key of the record that matches his instruction. There's no way to enforce the quality of service constraint if the settler cannot provide the key. The system can prevent the settler from making a mistake (in a technical or business sense), but only if the key is accurate.
+
+### Failure Scenarios
+
+Of course, the sunny day path is always the easiest to design. But what might go wrong? What happens if something goes wrong? The answers lead to new constraints that must be met. They are important inputs to the design process and will influence the implementation profoundly. The technical features of the components that we use also play an important role in the design and implementation.
+
+* *Duplicate Input Message.* If circumstances conspire to allow the ingester to somehow see the same input record twice, it needs to ensure that it doesn't generate a duplicate settlement. It does this by relying on the unique identifier, and always checking in the events database for an existing record before proceeding. This constraint actually can be applied to both the input (pending topic) records and the output (done topic). Kafka has some features that make duplicate messages less likely to arise in practice. If these features are used (basically storing the offsets in the same database as the events) then the only way duplicate inputs can be seen is through business, or human errors. The unique keys give some protection here, and duplicates should be rare enough that they can be safely discarded, but a carefully implemented system will probably store them and have someone look at them to confirm manually that they were mistakes.
+
+* *Duplicate Output Messages.* Since we haven't fully specified the business process from input (pending) to output (done), it might be prone to both technical and business errors that lead to duplicates. Again the unique keys allow the system to prevent duplicates from reaching downstream systems. It just has to check if an existing record exists before amending it.
+
+* *Missing Input Message.* It might happen that the ingester gets a "done" message that it can't match with an input record. It might be a business problem, or just a race condition, where the settlement happened faster than the pending record could be stored. In this case it has to flag the error and process it as an exception. Some automated processing involving a back-off and retry would be advisable, finally ending in a dead letter topic that can be processed more manually.
+
+* *Missing Output Message.* The settlment process could be fast, slow or variable. It might even take days or weeks to generate the final output message. The process definition has the constraint that all inputs must be matched with an output (and vice versa), but that doesn't mean that output messages will always be available immediately. Since we have protection against duplicate processing of output messages, though, we can allow the settlement process to be replayed for individual messages. The level of automation that is possible depends on the business expectations. The system should be able to offer insights into unmatched records and their age, so that decisions can be made about whether to wait a bit longer or to replay.
+
+* *Duplicate Events.* The events database might accidentally allow duplicate events - copies of the same input record, or multiple settlement instructions for the same payment. This is mitigated by making all interactions between the ingester and the events database transactional (in the ACID sense). Since the ingester is reading its own writes, some care has to be exercised: we need high consistency, and high (non-default usually) isolation, equivalent to READ_COMMITTED in a relational database. This will lead to locks and performance degradation.
++
+NOTE: It isn't clear that Kafka can be used as the events database because of this requirement to be able to read one's own writes. Prototypes have not been so far been successful (whereas a prototype with a relational database does work).
+
+The transaction boundaries can be overlaid onto the basic sequence diagram above:
+
+[plantuml]
+....
+collections PENDING as "TOPIC:\npending"
+participant DONE as "TOPIC:\ndone"
+participant Ingester
+database Events
+PENDING -> Ingester: record
+activate Ingester
+Ingester --> Ingester: extract key
+Ingester -> Events: key exists?
+activate Events
+Events -> Ingester: false
+Ingester -> Events: key,status=PENDING
+deactivate Events
+Ingester --> PENDING: ack
+deactivate Ingester
+DONE -> Ingester: key
+activate Ingester
+Ingester -> Events: key status?
+activate Events
+Events -> Ingester: PENDING
+Ingester -> Events: key,status=DONE
+deactivate Events
+Ingester --> DONE: ack
+deactivate Ingester
+....
+
+
+### Scalability
+
+Partitioning of the input and output topics is an important mechanism to enable scalability. The partitioning algorithm has to be consistent, so that the same consumer always gets the same message in the case of an (intentional or unintentional) duplicate.
+
+The ingester has to be able to read its own writes in the events database, so it needs to have strong transaction guarantees. When the ingester writes a new PENDING record, it has to show up in the next query for events with that key. If the database is a global relational monolith that might be problematic for scalability.
+
+If the input topic is partitioned though, the record keys don't have to be globally unique. They only have to be unique to a partition. Theoretically it might be possible to allow the events database to be split up into locally transactionally consistent stores. This will be problematic, though, because topology changes are frequent, and the event data would have to follow the re-assignment of partitions (e.g. when a node is removed). It's probably hard. A single relational database with a table per partition might scale well enough. Caveat: re-partitioning is already a major headache with Kafka, and this would make it worse.
+
 
 ## Pesky Side Effects
 
